@@ -3,13 +3,17 @@
  * All rights reserved.
  *
  * This source code is licensed under the BSD-style license found in the
- * LICENSE file in the root directory of this source tree. An additional grant
- * of patent rights can be found in the PATENTS file in the same directory.
+ * LICENSE file in the root directory of this source tree.
  */
 
 #include "gloo/transport/tcp/buffer.h"
 
 #include <string.h>
+#include <sys/types.h>
+#include <sys/syscall.h>
+#include <unistd.h>
+
+#include <iostream>
 
 #include "gloo/common/error.h"
 #include "gloo/common/logging.h"
@@ -23,6 +27,7 @@ Buffer::Buffer(Pair* pair, int slot, void* ptr, size_t size)
       pair_(pair),
       recvCompletions_(0),
       sendCompletions_(0),
+      sendPending_(0),
       ex_(nullptr) {}
 
 Buffer::~Buffer() {
@@ -52,7 +57,7 @@ void Buffer::waitRecv() {
     // hasn't arrived yet, wait until it does or read times out.
     auto timeout = pair_->getTimeout();
     auto pred = [&]{
-      checkErrorState();
+      throwIfException();
       return recvCompletions_ > 0;
     };
     std::unique_lock<std::mutex> lock(m_);
@@ -63,12 +68,9 @@ void Buffer::waitRecv() {
       auto done = recvCv_.wait_for(lock, timeout, pred);
       if (!done) {
         // Release the mutex before calling into the pair to avoid deadlock.
-        // Calling signalIoFailureExternal() will throw, so no need to
-        // reacquire.
         lock.unlock();
-        pair_->signalIoFailureExternal(
-            GLOO_ERROR_MSG("Read timeout ", pair_->peer().str()));
-        GLOO_ENFORCE(false, "Unexpected code path");
+        std::rethrow_exception(pair_->signalExceptionExternal(
+            GLOO_ERROR_MSG("Read timeout ", pair_->peer().str())));
       }
     }
     recvCompletions_--;
@@ -78,6 +80,7 @@ void Buffer::waitRecv() {
 void Buffer::handleSendCompletion() {
   std::lock_guard<std::mutex> lock(m_);
   sendCompletions_++;
+  sendPending_--;
   sendCv_.notify_one();
 }
 
@@ -93,23 +96,23 @@ void Buffer::waitSend() {
     // hasn't arrived yet, wait until it does or write times out.
     auto timeout = pair_->getTimeout();
     auto pred = [&]{
-      checkErrorState();
+      throwIfException();
       return sendCompletions_ > 0;
     };
     std::unique_lock<std::mutex> lock(m_);
-    if (timeout == kNoTimeout) {
-      // No timeout set. Wait for write to complete.
-      sendCv_.wait(lock, pred);
-    } else {
-      auto done = sendCv_.wait_for(lock, timeout, pred);
-      if (!done) {
-        // Release the mutex before calling into the pair to avoid deadlock.
-        // Calling signalIoFailureExternal() will throw, so no need to
-        // reacquire.
-        lock.unlock();
-        pair_->signalIoFailureExternal(
-            GLOO_ERROR_MSG("Write timeout ", pair_->peer().str()));
-        GLOO_ENFORCE(false, "Unexpected code path");
+    if (sendCompletions_ == 0) {
+      GLOO_ENFORCE_GT(sendPending_, 0, "No send to wait for");
+      if (timeout == kNoTimeout) {
+        // No timeout set. Wait for write to complete.
+        sendCv_.wait(lock, pred);
+      } else {
+        auto done = sendCv_.wait_for(lock, timeout, pred);
+        if (!done) {
+          // Release the mutex before calling into the pair to avoid deadlock.
+          lock.unlock();
+          std::rethrow_exception(pair_->signalExceptionExternal(
+              GLOO_ERROR_MSG("Write timeout ", pair_->peer().str())));
+        }
       }
     }
     sendCompletions_--;
@@ -124,27 +127,36 @@ void Buffer::send(size_t offset, size_t length, size_t roffset) {
   // to support this.
   GLOO_ENFORCE_LE(offset + length, size_);
 
-  memset(&op, 0, sizeof(op));
+  if (debug_) {
+    std::cout << "[" << getpid() << ": " << syscall(__NR_gettid) << "] ";
+    std::cout << "send " << length << " bytes";
+    std::cout << " to " << pair_->peer().str();
+    std::cout << std::endl;
+  }
 
-  op.preamble_.opcode_ = 0;
-  op.preamble_.slot_ = slot_;
-  op.preamble_.offset_ = offset;
-  op.preamble_.length_ = length;
-  op.preamble_.roffset_ = roffset;
-  op.buf_ = this;
+  op.preamble.nbytes = sizeof(op.preamble) + length;
+  op.preamble.opcode = Op::SEND_BUFFER;
+  op.preamble.slot = slot_;
+  op.preamble.offset = offset;
+  op.preamble.length = length;
+  op.preamble.roffset = roffset;
+  op.buf = this;
+
+  // Increment number of sends in flight
+  sendPending_++;
 
   // Pass to pair
   pair_->send(op);
 }
 
-void Buffer::signalError(const std::exception_ptr& ex) {
+void Buffer::signalException(std::exception_ptr ex) {
   std::lock_guard<std::mutex> lock(m_);
-  ex_ = ex;
+  ex_ = std::move(ex);
   recvCv_.notify_all();
   sendCv_.notify_all();
 }
 
-void Buffer::checkErrorState() {
+void Buffer::throwIfException() {
   if (ex_ != nullptr) {
     std::rethrow_exception(ex_);
   }

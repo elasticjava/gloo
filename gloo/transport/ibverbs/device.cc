@@ -3,20 +3,22 @@
  * All rights reserved.
  *
  * This source code is licensed under the BSD-style license found in the
- * LICENSE file in the root directory of this source tree. An additional grant
- * of patent rights can be found in the PATENTS file in the same directory.
+ * LICENSE file in the root directory of this source tree.
  */
 
 #include "gloo/transport/ibverbs/device.h"
 
 #include <fcntl.h>
 #include <poll.h>
+#include <string.h>
 
+#include <algorithm>
 #include <array>
 
 #include "gloo/common/error.h"
 #include "gloo/common/linux.h"
 #include "gloo/common/logging.h"
+#include "gloo/transport/ibverbs/context.h"
 #include "gloo/transport/ibverbs/pair.h"
 
 namespace gloo {
@@ -24,16 +26,16 @@ namespace transport {
 namespace ibverbs {
 
 // Scope guard for ibverbs device list.
-class ibv_devices {
+class IbvDevices {
  public:
-  ibv_devices() {
+  IbvDevices() {
     list_ = ibv_get_device_list(&size_);
     if (list_ == nullptr) {
       size_ = 0;
     }
   }
 
-  ~ibv_devices() {
+  ~IbvDevices() {
     if (list_ != nullptr) {
       ibv_free_device_list(list_);
     }
@@ -52,28 +54,43 @@ class ibv_devices {
   struct ibv_device** list_;
 };
 
-static ibv_context* createContext(const std::string& name) {
-  ibv_devices devices;
-
-  // Look for specified device name
-  struct ibv_device* dev = nullptr;
-  for (int i = 0; i < devices.size(); i++) {
-    if (name == devices[i]->name) {
-      dev = devices[i];
-      break;
-    }
+std::vector<std::string> getDeviceNames() {
+  IbvDevices devices;
+  std::vector<std::string> deviceNames;
+  for (auto i = 0; i < devices.size(); ++i) {
+    deviceNames.push_back(devices[i]->name);
   }
-
-  if (dev == nullptr) {
-    return nullptr;
-  }
-
-  return ibv_open_device(dev);
+  std::sort(deviceNames.begin(), deviceNames.end());
+  return deviceNames;
 }
 
 std::shared_ptr<::gloo::transport::Device> CreateDevice(
-    const struct attr& attr) {
-  auto context = createContext(attr.name);
+    const struct attr& constAttr) {
+  struct attr attr = constAttr;
+  IbvDevices devices;
+
+  // Default to using the first device if not specified
+  if (attr.name.empty()) {
+    if (devices.size() == 0) {
+      GLOO_THROW_INVALID_OPERATION_EXCEPTION(
+        "No ibverbs devices present");
+    }
+    std::vector<std::string> names;
+    for (auto i = 0; i < devices.size(); i++) {
+      names.push_back(devices[i]->name);
+    }
+    std::sort(names.begin(), names.end());
+    attr.name = names[0];
+  }
+
+  // Look for specified device name
+  ibv_context* context = nullptr;
+  for (int i = 0; i < devices.size(); i++) {
+    if (attr.name == devices[i]->name) {
+      context = ibv_open_device(devices[i]);
+      break;
+    }
+  }
   if (!context) {
     GLOO_THROW_INVALID_OPERATION_EXCEPTION(
         "Unable to find device named: ", attr.name);
@@ -84,9 +101,19 @@ std::shared_ptr<::gloo::transport::Device> CreateDevice(
 Device::Device(const struct attr& attr, ibv_context* context)
     : attr_(attr),
       pciBusID_(infinibandToBusID(attr.name)),
+      hasNvPeerMem_(kernelModules().count("nv_peer_mem") > 0),
       context_(context) {
   int rv;
 
+  // Query and store device attributes
+  rv = ibv_query_device(context_, &deviceAttr_);
+  GLOO_ENFORCE_EQ(rv, 0, "ibv_query_device: ", strerror(errno));
+
+  // Query and store port attributes
+  rv = ibv_query_port(context_, attr_.port, &portAttr_);
+  GLOO_ENFORCE_EQ(rv, 0, "ibv_query_port: ", strerror(errno));
+
+  // Protection domain
   pd_ = ibv_alloc_pd(context_);
   GLOO_ENFORCE(pd_);
 
@@ -125,7 +152,7 @@ std::string Device::str() const {
   ss << ", index=" << attr_.index;
 
   // nv_peer_mem module must be loaded for GPUDirect
-  if (kernelModules().count("nv_peer_mem") > 0) {
+  if (hasNvPeerMem_) {
     ss << ", gpudirect=ok";
   }
 
@@ -136,13 +163,14 @@ const std::string& Device::getPCIBusID() const {
   return pciBusID_;
 }
 
-void Device::setTimeout(const std::chrono::milliseconds& /* timeout */) {
-  GLOO_ENFORCE(false, "The ibverbs transport does not support setting timeout");
+bool Device::hasGPUDirect() const {
+  return hasNvPeerMem_;
 }
 
-std::unique_ptr<transport::Pair> Device::createPair() {
-  auto pair = new Pair(shared_from_this());
-  return std::unique_ptr<transport::Pair>(pair);
+std::shared_ptr<transport::Context> Device::createContext(
+    int rank, int size) {
+  return std::shared_ptr<transport::Context>(
+      new ibverbs::Context(shared_from_this(), rank, size));
 }
 
 void Device::loop() {

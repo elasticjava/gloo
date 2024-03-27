@@ -3,8 +3,7 @@
  * All rights reserved.
  *
  * This source code is licensed under the BSD-style license found in the
- * LICENSE file in the root directory of this source tree. An additional grant
- * of patent rights can be found in the PATENTS file in the same directory.
+ * LICENSE file in the root directory of this source tree.
  */
 
 #pragma once
@@ -29,19 +28,23 @@ class AllreduceRing : public Algorithm {
         ptrs_(ptrs),
         count_(count),
         bytes_(count_ * sizeof(T)),
-        fn_(fn),
-        leftPair_(this->getLeftPair()),
-        rightPair_(this->getRightPair()) {
+        fn_(fn) {
     inbox_ = static_cast<T*>(malloc(bytes_));
     outbox_ = static_cast<T*>(malloc(bytes_));
 
+    if (this->contextSize_ == 1) {
+      return;
+    }
+
+    auto& leftPair = this->getLeftPair();
+    auto& rightPair = this->getRightPair();
     auto slot = this->context_->nextSlot();
 
     // Buffer to send to (rank+1).
-    sendDataBuf_ = rightPair_->createSendBuffer(slot, outbox_, bytes_);
+    sendDataBuf_ = rightPair->createSendBuffer(slot, outbox_, bytes_);
 
     // Buffer that (rank-1) writes to.
-    recvDataBuf_ = leftPair_->createRecvBuffer(slot, inbox_, bytes_);
+    recvDataBuf_ = leftPair->createRecvBuffer(slot, inbox_, bytes_);
 
     // Dummy buffers for localized barrier.
     // Before sending to the right, we only need to know that the node
@@ -49,9 +52,9 @@ class AllreduceRing : public Algorithm {
     // into. No need for a global barrier.
     auto notificationSlot = this->context_->nextSlot();
     sendNotificationBuf_ =
-      leftPair_->createSendBuffer(notificationSlot, &dummy_, sizeof(dummy_));
+      leftPair->createSendBuffer(notificationSlot, &dummy_, sizeof(dummy_));
     recvNotificationBuf_ =
-      rightPair_->createRecvBuffer(notificationSlot, &dummy_, sizeof(dummy_));
+      rightPair->createRecvBuffer(notificationSlot, &dummy_, sizeof(dummy_));
   }
 
   virtual ~AllreduceRing() {
@@ -64,6 +67,10 @@ class AllreduceRing : public Algorithm {
   }
 
   void run() {
+    if (count_ == 0) {
+      return;
+    }
+
     // Reduce specified pointers into ptrs_[0]
     for (int i = 1; i < ptrs_.size(); i++) {
       fn_->call(ptrs_[0], ptrs_[i], count_);
@@ -110,9 +117,6 @@ class AllreduceRing : public Algorithm {
   const int count_;
   const int bytes_;
   const ReductionFunction<T>* fn_;
-
-  std::unique_ptr<transport::Pair>& leftPair_;
-  std::unique_ptr<transport::Pair>& rightPair_;
 
   T* inbox_;
   T* outbox_;

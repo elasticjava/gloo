@@ -3,8 +3,7 @@
  * All rights reserved.
  *
  * This source code is licensed under the BSD-style license found in the
- * LICENSE file in the root directory of this source tree. An additional grant
- * of patent rights can be found in the PATENTS file in the same directory.
+ * LICENSE file in the root directory of this source tree.
  */
 
 #pragma once
@@ -21,7 +20,7 @@ extern const size_t kOnDeviceThreshold;
 class Algorithm {
  public:
   explicit Algorithm(const std::shared_ptr<Context>&);
-  virtual ~Algorithm() = 0;
+  virtual ~Algorithm() noexcept(false) = 0;
 
   virtual void run() = 0;
 
@@ -102,7 +101,7 @@ const ReductionFunction<T>* ReductionFunction<T>::max =
 template <typename T>
 class LocalOp {
  public:
-  virtual ~LocalOp() {}
+  virtual ~LocalOp() noexcept(false) {}
   virtual void runAsync() = 0;
   virtual void wait() = 0;
 

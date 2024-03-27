@@ -3,18 +3,24 @@
  * All rights reserved.
  *
  * This source code is licensed under the BSD-style license found in the
- * LICENSE file in the root directory of this source tree. An additional grant
- * of patent rights can be found in the PATENTS file in the same directory.
+ * LICENSE file in the root directory of this source tree.
  */
 
 #pragma once
 
 #include <atomic>
 #include <thread>
+#include <vector>
 
 #include <infiniband/verbs.h>
 
+#include "gloo/config.h"
 #include "gloo/transport/device.h"
+
+// Check that configuration header was properly generated
+#if !GLOO_HAVE_TRANSPORT_IBVERBS
+#error "Expected GLOO_HAVE_TRANSPORT_IBVERBS to be defined"
+#endif
 
 namespace gloo {
 namespace transport {
@@ -25,6 +31,9 @@ struct attr {
   int port;
   int index;
 };
+
+// Helper function that returns the list of IB device names in sorted order
+std::vector<std::string> getDeviceNames();
 
 std::shared_ptr<::gloo::transport::Device> CreateDevice(
     const struct attr&);
@@ -45,15 +54,18 @@ class Device : public ::gloo::transport::Device,
 
   virtual const std::string& getPCIBusID() const override;
 
-  virtual void setTimeout(const std::chrono::milliseconds& timeout) override;
+  virtual bool hasGPUDirect() const override;
 
-  virtual std::unique_ptr<::gloo::transport::Pair> createPair()
-      override;
+  virtual std::shared_ptr<::gloo::transport::Context> createContext(
+      int rank, int size) override;
 
  protected:
   struct attr attr_;
   const std::string pciBusID_;
+  const bool hasNvPeerMem_;
   ibv_context* context_;
+  ibv_device_attr deviceAttr_;
+  ibv_port_attr portAttr_;
   ibv_pd* pd_;
   ibv_comp_channel* comp_channel_;
 

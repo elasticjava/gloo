@@ -3,12 +3,12 @@
  * All rights reserved.
  *
  * This source code is licensed under the BSD-style license found in the
- * LICENSE file in the root directory of this source tree. An additional grant
- * of patent rights can be found in the PATENTS file in the same directory.
+ * LICENSE file in the root directory of this source tree.
  */
 
 #pragma once
 
+#include <atomic>
 #include <condition_variable>
 #include <exception>
 #include <map>
@@ -52,6 +52,7 @@ class Buffer : public ::gloo::transport::Buffer {
 
   int recvCompletions_;
   int sendCompletions_;
+  std::atomic<int> sendPending_;
 
   std::exception_ptr ex_;
 

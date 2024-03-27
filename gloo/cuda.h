@@ -3,12 +3,12 @@
  * All rights reserved.
  *
  * This source code is licensed under the BSD-style license found in the
- * LICENSE file in the root directory of this source tree. An additional grant
- * of patent rights can be found in the PATENTS file in the same directory.
+ * LICENSE file in the root directory of this source tree.
  */
 
 #pragma once
 
+#include <algorithm>
 #include <atomic>
 #include <mutex>
 
@@ -16,11 +16,18 @@
 #include <cuda_runtime.h>
 
 #include "gloo/algorithm.h"
+#include "gloo/config.h"
 #include "gloo/common/logging.h"
+
+// Check that configuration header was properly generated
+#if !GLOO_USE_CUDA
+#error "Expected GLOO_USE_CUDA to be defined"
+#endif
 
 namespace gloo {
 
 extern const cudaStream_t kStreamNotSet;
+extern const int kInvalidDeviceId;
 
 // Forward declarations
 template<typename T>
@@ -53,7 +60,7 @@ class CudaStream {
   // Move constructor
   CudaStream(CudaStream&& other) noexcept;
 
-  ~CudaStream();
+  ~CudaStream() noexcept(false);
 
   cudaStream_t operator*() const {
     return stream_;
@@ -113,15 +120,19 @@ class CudaDevicePointer {
 
   static CudaDevicePointer<T> create(T* ptr, size_t count);
 
+  static CudaDevicePointer<T> create(const CudaDevicePointer<T>& ptr) {
+    return CudaDevicePointer<T>::create(*ptr, ptr.getCount());
+  }
+
   CudaDevicePointer(CudaDevicePointer&&) noexcept;
-  ~CudaDevicePointer();
+  ~CudaDevicePointer() noexcept(false);
 
   // Default constructor creates invalid instance
   CudaDevicePointer()
       : device_(nullptr),
         count_(0),
         owner_(false),
-        deviceId_(-1) {}
+        deviceId_(kInvalidDeviceId) {}
 
   // Move assignment operator
   CudaDevicePointer& operator=(CudaDevicePointer&&);
@@ -179,8 +190,12 @@ class CudaHostPointer {
  public:
   static CudaHostPointer<T> alloc(size_t count);
 
+  static CudaHostPointer<T> create(T* ptr, size_t count) {
+    return CudaHostPointer<T>(ptr, count, false);
+  }
+
   CudaHostPointer(CudaHostPointer&&) noexcept;
-  ~CudaHostPointer();
+  ~CudaHostPointer() noexcept(false);
 
   // Default constructor creates invalid instance
   CudaHostPointer() : CudaHostPointer(nullptr, 0, false) {}
@@ -227,6 +242,33 @@ class CudaHostPointer {
   // Record whether or not this instance is this pointer's owner so
   // that it is freed when this instance is destructed.
   bool owner_ = false;
+};
+
+template <typename T, typename Src, typename Dst>
+class CudaLocalMemcpy : public LocalOp<T> {
+ public:
+  CudaLocalMemcpy(
+    CudaStream& stream,
+    Src& src,
+    Dst& dst,
+    size_t offset,
+    size_t count)
+      : stream_(stream),
+        src_(src.range(offset, count)),
+        dst_(dst.range(offset, count)) {}
+
+  virtual void runAsync() {
+    stream_.copyAsync(dst_, src_);
+  }
+
+  virtual void wait() {
+    stream_.wait();
+  }
+
+ protected:
+  CudaStream& stream_;
+  Src src_;
+  Dst dst_;
 };
 
 template <typename T>

@@ -3,8 +3,7 @@
  * All rights reserved.
  *
  * This source code is licensed under the BSD-style license found in the
- * LICENSE file in the root directory of this source tree. An additional grant
- * of patent rights can be found in the PATENTS file in the same directory.
+ * LICENSE file in the root directory of this source tree.
  */
 
 #pragma once
@@ -17,10 +16,12 @@ namespace gloo {
 
 const std::set<std::string>& kernelModules();
 
-const int kPCIClass3D = 0x030200;
-const int kPCIClassNetwork = 0x020000;
+struct PCIClassMatch {
+  int value;
+  int mask;
+};
 
-std::vector<std::string> pciDevices(int pciBusID);
+std::vector<std::string> pciDevices(PCIClassMatch);
 
 int pciDistance(const std::string& a, const std::string& b);
 

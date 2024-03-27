@@ -3,8 +3,7 @@
  * All rights reserved.
  *
  * This source code is licensed under the BSD-style license found in the
- * LICENSE file in the root directory of this source tree. An additional grant
- * of patent rights can be found in the PATENTS file in the same directory.
+ * LICENSE file in the root directory of this source tree.
  */
 
 #pragma once
@@ -43,14 +42,12 @@ class CudaAllreduceRing : public Algorithm {
   std::vector<CudaDevicePointer<T> > devicePtrs_;
   std::vector<CudaStream> streams_;
   typename W::Pointer scratch_;
+  CudaStream* scratchStream_;
 
   const int count_;
   const int bytes_;
   const bool synchronizeDeviceOutputs_;
   const CudaReductionFunction<T>* fn_;
-
-  std::unique_ptr<transport::Pair>& leftPair_;
-  std::unique_ptr<transport::Pair>& rightPair_;
 
   std::unique_ptr<LocalOp<T> > localReduceOp_;
   std::unique_ptr<LocalOp<T> > localBroadcastOp_;

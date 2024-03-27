@@ -3,8 +3,7 @@
  * All rights reserved.
  *
  * This source code is licensed under the BSD-style license found in the
- * LICENSE file in the root directory of this source tree. An additional grant
- * of patent rights can be found in the PATENTS file in the same directory.
+ * LICENSE file in the root directory of this source tree.
  */
 
 #pragma once
@@ -35,6 +34,8 @@ class FileStore : public Store {
       const std::vector<std::string>& keys,
       const std::chrono::milliseconds& timeout) override;
 
+  std::vector<std::string> getAllKeyFilePaths();
+
  protected:
   std::string basePath_;
 
@@ -45,6 +46,8 @@ class FileStore : public Store {
   std::string objectPath(const std::string& name);
 
   bool check(const std::vector<std::string>& keys);
+
+  std::vector<std::string> keyFilePaths_;
 };
 
 } // namespace rendezvous

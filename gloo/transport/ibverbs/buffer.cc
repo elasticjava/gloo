@@ -3,12 +3,12 @@
  * All rights reserved.
  *
  * This source code is licensed under the BSD-style license found in the
- * LICENSE file in the root directory of this source tree. An additional grant
- * of patent rights can be found in the PATENTS file in the same directory.
+ * LICENSE file in the root directory of this source tree.
  */
 
 #include "gloo/transport/ibverbs/buffer.h"
 
+#include <errno.h>
 #include <string.h>
 #include <sys/types.h>
 #include <unistd.h>
@@ -27,15 +27,40 @@ Buffer::Buffer(Pair* pair, int slot, void* ptr, size_t size)
       pair_(pair),
       recvCompletions_(0),
       sendCompletions_(0),
+      sendPending_(0),
       ex_(nullptr) {
   mr_ = ibv_reg_mr(
       pair_->dev_->pd_,
       ptr_,
       size_,
       IBV_ACCESS_LOCAL_WRITE | IBV_ACCESS_REMOTE_WRITE);
+
+  // Provide hint if the error is EFAULT and nv_peer_mem is not loaded
+  if (mr_ == nullptr && errno == EFAULT) {
+    if (!pair->dev_->hasNvPeerMem_) {
+      GLOO_ENFORCE(
+        mr_ != nullptr,
+        "ibv_reg_mr: ",
+        strerror(errno),
+        " (kernel module 'nv_peer_mem' not loaded;"
+        " did you specify a pointer to GPU memory?)");
+    }
+  }
+
+  // Provide hint if the error is ENOMEM
+  if (mr_ == nullptr && errno == ENOMEM) {
+    GLOO_ENFORCE(
+      mr_ != nullptr,
+      "ibv_reg_mr: ",
+      strerror(errno),
+      " (did you run into the locked memory limit?)");
+  }
+
+  GLOO_ENFORCE(mr_ != nullptr, "ibv_reg_mr: ", strerror(errno));
 }
 
 Buffer::~Buffer() {
+  GLOO_ENFORCE_EQ(sendPending_, 0, "Destructing buffer expecting completions");
   ibv_dereg_mr(mr_);
 }
 
@@ -45,21 +70,43 @@ void Buffer::waitRecv() {
   // responsible for polling for work completions.
   // Since a single pair potentially serves multiple buffers, a
   // completion may be intended for another buffer.
+  auto timeout = pair_->getTimeout();
   if (pair_->sync_) {
+    auto start = std::chrono::steady_clock::now();
     // We can assume a single pair is never used by more than one
     // thread, so there is no need to acquire the mutex here.
     while (recvCompletions_ == 0) {
       pair_->pollCompletions();
+      if (timeout != kNoTimeout &&
+          (std::chrono::steady_clock::now() - start) >= timeout) {
+        pair_->signalIoFailure(
+          GLOO_ERROR_MSG("Read timeout ", pair_->peer().str()));
+        GLOO_ENFORCE(false, "Unexpected code path");
+      }
     }
     recvCompletions_--;
   } else {
     // The device thread will signal completion. If the completion
     // hasn't arrived yet, wait until it does.
-    std::unique_lock<std::mutex> lock(m_);
-    checkErrorState();
-    while (recvCompletions_ == 0) {
-      recvCv_.wait(lock);
+    auto pred = [&]{
       checkErrorState();
+      return recvCompletions_ > 0;
+    };
+    std::unique_lock<std::mutex> lock(m_);
+    if (timeout == kNoTimeout) {
+      // No timeout set. Wait for read to complete.
+      recvCv_.wait(lock, pred);
+    } else {
+      auto done = recvCv_.wait_for(lock, timeout, pred);
+      if (!done) {
+        // Release the mutex before calling into the pair to avoid deadlock.
+        // Calling signalIoFailure() will throw, so no need to
+        // reacquire.
+        lock.unlock();
+        pair_->signalIoFailure(
+          GLOO_ERROR_MSG("Read timeout ", pair_->peer().str()));
+        GLOO_ENFORCE(false, "Unexpected code path");
+      }
     }
     recvCompletions_--;
   }
@@ -69,11 +116,24 @@ void Buffer::waitRecv() {
 void Buffer::waitSend() {
   // If the pair is in synchronous mode, the current thread is
   // responsible for polling for work completions.
+  auto timeout = pair_->getTimeout();
   if (pair_->sync_) {
     // We can assume a single pair is never used by more than one
     // thread, so there is no need to acquire the mutex here.
-    while (sendCompletions_ == 0) {
-      pair_->pollCompletions();
+    if (sendCompletions_ == 0) {
+      GLOO_ENFORCE_GT(sendPending_, 0, "No send to wait for");
+      auto start = std::chrono::steady_clock::now();
+      // We can assume a single pair is never used by more than one
+      // thread, so there is no need to acquire the mutex here.
+      while (sendCompletions_ == 0) {
+        pair_->pollCompletions();
+        if (timeout != kNoTimeout &&
+            (std::chrono::steady_clock::now() - start) >= timeout) {
+          pair_->signalIoFailure(
+            GLOO_ERROR_MSG("Send timeout ", pair_->peer().str()));
+          GLOO_ENFORCE(false, "Unexpected code path");
+        }
+      }
     }
     sendCompletions_--;
   } else {
@@ -81,9 +141,27 @@ void Buffer::waitSend() {
     // hasn't arrived yet, wait until it does.
     std::unique_lock<std::mutex> lock(m_);
     checkErrorState();
-    while (sendCompletions_ == 0) {
-      sendCv_.wait(lock);
-      checkErrorState();
+    if (sendCompletions_ == 0) {
+      GLOO_ENFORCE_GT(sendPending_, 0, "No send to wait for");
+      auto pred = [&]{
+        checkErrorState();
+        return sendCompletions_ > 0;
+      };
+      if (timeout == kNoTimeout) {
+        // No timeout set. Wait for read to complete.
+        sendCv_.wait(lock, pred);
+      } else {
+        auto done = sendCv_.wait_for(lock, timeout, pred);
+        if (!done) {
+          // Release the mutex before calling into the pair to avoid deadlock.
+          // Calling signalIoFailure() will throw, so no need to
+          // reacquire.
+          lock.unlock();
+          pair_->signalIoFailure(
+            GLOO_ERROR_MSG("Send timeout ", pair_->peer().str()));
+          GLOO_ENFORCE(false, "Unexpected code path");
+        }
+      }
     }
     sendCompletions_--;
   }
@@ -108,30 +186,10 @@ void Buffer::send(size_t offset, size_t length, size_t roffset) {
     std::cout << std::endl;
   }
 
-  struct ibv_sge list;
-  list.addr = (uint64_t)ptr_ + offset;
-  list.length = length;
-  list.lkey = mr_->lkey;
+  // Increment number of sends in flight
+  sendPending_++;
 
-  struct ibv_send_wr wr;
-  memset(&wr, 0, sizeof(wr));
-  wr.wr_id = slot_;
-  wr.sg_list = &list;
-  wr.num_sge = 1;
-  wr.opcode = IBV_WR_RDMA_WRITE_WITH_IMM;
-  wr.send_flags = IBV_SEND_SIGNALED;
-  wr.imm_data = slot_;
-
-  const struct ibv_mr* peer = pair_->getMemoryRegion(slot_);
-  GLOO_ENFORCE_NE(peer, (const struct ibv_mr*)nullptr);
-  wr.wr.rdma.remote_addr = (uint64_t)peer->addr + roffset;
-  wr.wr.rdma.rkey = peer->rkey;
-
-  struct ibv_send_wr* bad_wr;
-  rv = ibv_post_send(pair_->qp_, &wr, &bad_wr);
-  if (rv != 0) {
-    pair_->signalIoFailure(GLOO_ERROR_MSG("ibv_post_send: ", rv));
-  }
+  pair_->send(this, offset, length, roffset);
 }
 
 void Buffer::handleCompletion(struct ibv_wc* wc) {
@@ -152,6 +210,7 @@ void Buffer::handleCompletion(struct ibv_wc* wc) {
     }
     std::unique_lock<std::mutex> lock(m_);
     sendCompletions_++;
+    sendPending_--;
     sendCv_.notify_one();
   } else {
     GLOO_ENFORCE(false, "Unexpected completion (opcode: ", wc->opcode, ")");

@@ -3,8 +3,7 @@
  * All rights reserved.
  *
  * This source code is licensed under the BSD-style license found in the
- * LICENSE file in the root directory of this source tree. An additional grant
- * of patent rights can be found in the PATENTS file in the same directory.
+ * LICENSE file in the root directory of this source tree.
  */
 
 #pragma once
@@ -32,6 +31,8 @@ class Address : public ::gloo::transport::Address {
   virtual std::string str() const override;
 
  protected:
+  explicit Address(const Address&) = default;
+
   struct {
     uint32_t lid;
     uint32_t qpn;

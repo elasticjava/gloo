@@ -3,15 +3,14 @@
  * All rights reserved.
  *
  * This source code is licensed under the BSD-style license found in the
- * LICENSE file in the root directory of this source tree. An additional grant
- * of patent rights can be found in the PATENTS file in the same directory.
+ * LICENSE file in the root directory of this source tree.
  */
 
 #include "gloo/cuda_broadcast_one_to_all.h"
 
-#include "gloo/common/logging.h"
+#include "gloo/cuda_collectives_device.h"
+#include "gloo/cuda_collectives_host.h"
 #include "gloo/cuda_private.h"
-#include "gloo/nccl/nccl.h"
 
 namespace gloo {
 
@@ -55,25 +54,38 @@ CudaBroadcastOneToAll<T, W>::CudaBroadcastOneToAll(
   if (contextSize_ > 1) {
     auto slot = context_->nextSlot();
     if (contextRank_ == rootRank_) {
-      for (int i = 0; i < contextSize_; i++) {
+      sender_.resize(contextSize_);
+      for (auto i = 0; i < contextSize_; i++) {
         if (i == contextRank_) {
           continue;
         }
 
+        sender_[i] = make_unique<forSender>();
         auto& pair = context_->getPair(i);
-        sendDataBuffers_.push_back(
-          pair->createSendBuffer(slot, *scratch_, bytes_));
+        sender_[i]->clearToSendBuffer = pair->createRecvBuffer(
+            slot, &sender_[i]->dummy, sizeof(sender_[i]->dummy));
+        sender_[i]->sendBuffer = pair->createSendBuffer(
+            slot, *scratch_, bytes_);
       }
     } else {
+      receiver_ = make_unique<forReceiver>();
       auto& rootPair = context_->getPair(rootRank_);
-      recvDataBuffer_ = rootPair->createRecvBuffer(slot, *scratch_, bytes_);
+      receiver_->clearToSendBuffer = rootPair->createSendBuffer(
+          slot, &receiver_->dummy, sizeof(receiver_->dummy));
+      receiver_->recvBuffer = rootPair->createRecvBuffer(
+          slot, *scratch_, bytes_);
     }
   }
 
   // Setup local broadcast if needed
   if (devicePtrs_.size() > 1) {
     localBroadcastOp_ =
-      cudaDeviceBroadcast(streams_, devicePtrs_, devicePtrs_[0], 0, count_);
+      cudaDeviceBroadcast(
+          streams_,
+          devicePtrs_,
+          devicePtrs_[rootPointerRank],
+          0,
+          count_);
   }
 }
 
@@ -96,9 +108,13 @@ void CudaBroadcastOneToAll<T, W>::run() {
     stream.copyAsync(scratch_, devicePtrs_[rootPointerRank_]);
     stream.wait();
 
-    // Fire off all send operations concurrently
-    for (auto& buf : sendDataBuffers_) {
-      buf->send();
+    // Fire off send operations after receiving clear to send
+    for (auto i = 0; i < contextSize_; i++) {
+      if (i == contextRank_) {
+        continue;
+      }
+      sender_[i]->clearToSendBuffer->waitRecv();
+      sender_[i]->sendBuffer->send();
     }
 
     // Broadcast locally while sends are happening
@@ -110,14 +126,20 @@ void CudaBroadcastOneToAll<T, W>::run() {
     }
 
     // Wait for all send operations to complete
-    for (auto& buf : sendDataBuffers_) {
-      buf->waitSend();
+    for (auto i = 0; i < contextSize_; i++) {
+      if (i == contextRank_) {
+        continue;
+      }
+      sender_[i]->sendBuffer->waitSend();
     }
   } else {
     CudaStream& stream = streams_[rootPointerRank_];
+    // Ensure previous H2D copy is complete before notifying the sender
+    // NOTE: this only waits for last copyAsync, not for the whole stream
+    stream.wait();
 
-    // Wait on buffer
-    recvDataBuffer_->waitRecv();
+    receiver_->clearToSendBuffer->send();
+    receiver_->recvBuffer->waitRecv();
 
     // Copy host buffer to device
     stream.copyAsync(devicePtrs_[rootPointerRank_], scratch_);
@@ -152,16 +174,32 @@ void CudaBroadcastOneToAll<T, W>::init(
   }
 }
 
+template <typename T, typename W>
+template <typename U>
+void CudaBroadcastOneToAll<T, W>::init(
+    typename std::enable_if<std::is_same<U, CudaDeviceWorkspace<T> >::value,
+                            typename U::Pointer>::type*) {
+  if (contextSize_ > 1) {
+    // For GPUDirect, an additional buffer allocation is unnecessary.
+    // Instead, use the provided input buffer itself as the scratch space.
+    // The caller is the owner_
+    scratch_ = CudaDevicePointer<T>::create(devicePtrs_[0]);
+  }
+}
+
 // Instantiate templates
 #define INSTANTIATE_TEMPLATE(T)                                         \
-template class CudaBroadcastOneToAll<T, CudaHostWorkspace<T> >;
+template class CudaBroadcastOneToAll<T, CudaHostWorkspace<T> >;         \
+template class CudaBroadcastOneToAll<T, CudaDeviceWorkspace<T> >;
 
 
 INSTANTIATE_TEMPLATE(int8_t);
+INSTANTIATE_TEMPLATE(uint8_t);
 INSTANTIATE_TEMPLATE(int32_t);
 INSTANTIATE_TEMPLATE(int64_t);
 INSTANTIATE_TEMPLATE(uint64_t);
 INSTANTIATE_TEMPLATE(float);
 INSTANTIATE_TEMPLATE(double);
+INSTANTIATE_TEMPLATE(float16);
 
 } // namespace gloo

@@ -3,8 +3,7 @@
  * All rights reserved.
  *
  * This source code is licensed under the BSD-style license found in the
- * LICENSE file in the root directory of this source tree. An additional grant
- * of patent rights can be found in the PATENTS file in the same directory.
+ * LICENSE file in the root directory of this source tree.
  */
 
 #include "gloo/nccl/nccl.h"
@@ -36,6 +35,16 @@ class NCCLContext {
     NCCL_CHECK(ncclCommInitAll(comms.data(), devices.size(), devices.data()));
   }
   ~NCCLContext() {
+    /*
+     * TODO(T30279827) Temporarily disable calling ncclCommDestroy
+     * Calling ncclCommDestroy while program exiting is undefined
+     * according to nvidia, and lead to segfault in NCCL 2
+     * (whether it is called before or after the CUDA runtime destructor).
+     * Temporarily disable it in destructor to avoid segfault.
+     * Following up with Nvidia for long term solution.
+     */
+
+    /*
     for (auto i = 0; i < devices.size(); ++i) {
       CudaDeviceScope scope(devices[i]);
       {
@@ -44,6 +53,7 @@ class NCCLContext {
         ncclCommDestroy(comms[i]);
       }
     }
+    */
   }
 
   // Instances cannot be copied or copy-assigned
@@ -87,7 +97,7 @@ NCCLExecution<T>::NCCLExecution(std::vector<NCCLElement<T>>&& elements)
 }
 
 template <typename T>
-NCCLExecution<T>::~NCCLExecution() {
+NCCLExecution<T>::~NCCLExecution() noexcept(false) {
   for (auto i = 0; i < this->elements.size(); i++) {
     CudaDeviceScope scope(this->elements[i].device);
     CUDA_CHECK(cudaEventDestroy(ncclEvents[i]));
@@ -130,6 +140,12 @@ class ncclTypeWrapper<int8_t> {
 };
 
 template <>
+class ncclTypeWrapper<uint8_t> {
+ public:
+  static const ncclDataType_t type = ncclChar;
+};
+
+template <>
 class ncclTypeWrapper<int32_t> {
  public:
   static const ncclDataType_t type = ncclInt;
@@ -145,6 +161,12 @@ template <>
 class ncclTypeWrapper<uint64_t> {
  public:
   static const ncclDataType_t type = ncclUint64;
+};
+
+template <>
+class ncclTypeWrapper<float16> {
+ public:
+  static const ncclDataType_t type = ncclHalf;
 };
 
 template <>
@@ -182,6 +204,9 @@ void NCCLOp<T>::runNCCL(F&& f) {
   // Synchronize memory allocation with NCCL operations
   std::lock_guard<std::mutex> lock(CudaShared::getMutex());
 
+#if NCCL_VERSION_MIN(2,0,0)
+  NCCL_CHECK(ncclGroupStart());
+#endif
   // Kick off the NCCL operation on each device
   for (auto i = 0; i < elements.size(); i++) {
     const auto& element = elements[i];
@@ -203,6 +228,17 @@ void NCCLOp<T>::runNCCL(F&& f) {
     }
     // Run the operation
     f(element, comms[i], ncclStream);
+  }
+#if NCCL_VERSION_MIN(2,0,0)
+  NCCL_CHECK(ncclGroupEnd());
+#endif
+  for (auto i = 0; i < elements.size(); ++i) {
+    const auto& element = elements[i];
+    const auto& ncclStream = getNcclStreams()[element.device];
+    const auto& dstStream = element.dstStream.getStream();
+    const auto& dstEvent = element.dstStream.getEvent();
+
+    CudaDeviceScope scope(element.device);
     // Record an event in the NCCL stream signaling the operation is complete.
     // Synchronize with the destination stream.
     CUDA_CHECK(cudaEventRecord(ncclEvents[i], ncclStream));
@@ -280,6 +316,15 @@ template <typename T>
 void AllgatherOp<T>::runAsync() {
   this->runNCCL([](
       const NCCLElement<T>& element, ncclComm_t comm, cudaStream_t stream) {
+#if NCCL_VERSION_MIN(2,0,0)
+    NCCL_CHECK(ncclAllGather(
+        *element.src,
+        *element.dst,
+        element.src.getCount(),
+        ncclTypeWrapper<T>::type,
+        comm,
+        stream));
+#else
     NCCL_CHECK(ncclAllGather(
         *element.src,
         element.src.getCount(),
@@ -287,6 +332,7 @@ void AllgatherOp<T>::runAsync() {
         *element.dst,
         comm,
         stream));
+#endif
   });
 }
 
@@ -302,9 +348,11 @@ template class BroadcastOp<T>;                                          \
 template class AllgatherOp<T>;
 
 DEFINE_NCCL_TYPES_AND_OPS(int8_t);
+DEFINE_NCCL_TYPES_AND_OPS(uint8_t);
 DEFINE_NCCL_TYPES_AND_OPS(int32_t);
 DEFINE_NCCL_TYPES_AND_OPS(int64_t);
 DEFINE_NCCL_TYPES_AND_OPS(uint64_t);
+DEFINE_NCCL_TYPES_AND_OPS(float16);
 DEFINE_NCCL_TYPES_AND_OPS(float);
 DEFINE_NCCL_TYPES_AND_OPS(double);
 

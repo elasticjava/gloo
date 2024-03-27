@@ -3,8 +3,7 @@
  * All rights reserved.
  *
  * This source code is licensed under the BSD-style license found in the
- * LICENSE file in the root directory of this source tree. An additional grant
- * of patent rights can be found in the PATENTS file in the same directory.
+ * LICENSE file in the root directory of this source tree.
  */
 
 #include "gloo/transport/ibverbs/pair.h"
@@ -21,18 +20,17 @@ namespace gloo {
 namespace transport {
 namespace ibverbs {
 
-Pair::Pair(const std::shared_ptr<Device>& dev)
+Pair::Pair(
+    const std::shared_ptr<Device>& dev,
+    std::chrono::milliseconds timeout)
     : dev_(dev),
       sync_(false),
       busyPoll_(false),
+      timeout_(timeout),
       completionEventsHandled_(0),
-      peerMemoryRegionsReady_(0),
+      recvPosted_(0),
       ex_(nullptr) {
   int rv;
-
-  memset(peerMemoryRegions_.data(), 0, sizeof(peerMemoryRegions_));
-  memset(sendCompletionHandlers_.data(), 0, sizeof(sendCompletionHandlers_));
-  memset(recvCompletionHandlers_.data(), 0, sizeof(recvCompletionHandlers_));
 
   // Create completion queue
   {
@@ -103,12 +101,16 @@ Pair::Pair(const std::shared_ptr<Device>& dev)
     self_.addr_.psn = rand() & 0xffffff;
   }
 
-  // Post receive requests for the remote memory regions.
-  // The remote side of this pair will call the 'recv' function to
-  // register a receive buffer. The memory region will be registered
-  // and the identifier sent to this side of the pair.
+  // Post receive requests before connecting.
+  // Whenever the remote side of this pair registers receive buffers,
+  // this triggers their memory registration to be sent to this side.
+  // Since these sends are one-sided, we always need a full bench of
+  // receive work requests. Memory region receives can be interleaved
+  // with regular buffer writes, so we proactively include a memory
+  // region in every receive work request.
   for (int i = 0; i < kMaxBuffers; ++i) {
-    receiveMemoryRegion();
+    mappedRecvRegions_[i] = make_unique<MemoryRegion>(dev_->pd_);
+    postReceive();
   }
 }
 
@@ -124,6 +126,15 @@ Pair::~Pair() {
 
   rv = ibv_destroy_cq(cq_);
   GLOO_ENFORCE_EQ(rv, 0);
+}
+
+void Pair::close() {
+  if (closed_) {
+    // TODO: add proper handling of duplicate closes T21171834
+    return;
+  }
+
+  closed_ = true;
 }
 
 const Address& Pair::address() const {
@@ -144,11 +155,15 @@ void Pair::connect(const std::vector<char>& bytes) {
   attr.rq_psn = peer_.addr_.psn;
   attr.max_dest_rd_atomic = 1;
   attr.min_rnr_timer = 20;
+  attr.ah_attr.is_global = 0;
+  attr.ah_attr.dlid = peer_.addr_.lid;
   attr.ah_attr.port_num = dev_->attr_.port;
-  attr.ah_attr.is_global = 1;
-  memcpy(&attr.ah_attr.grh.dgid, &peer_.addr_.ibv_gid, 16);
-  attr.ah_attr.grh.hop_limit = 1;
-  attr.ah_attr.grh.sgid_index = dev_->attr_.index;
+  if (peer_.addr_.ibv_gid.global.interface_id) {
+    attr.ah_attr.is_global = 1;
+    attr.ah_attr.grh.hop_limit = 1;
+    attr.ah_attr.grh.dgid = peer_.addr_.ibv_gid;
+    attr.ah_attr.grh.sgid_index = dev_->attr_.index;
+  }
 
   // Move to Ready To Receive (RTR) state
   rv = ibv_modify_qp(
@@ -204,42 +219,17 @@ void Pair::setSync(bool sync, bool busyPoll) {
   busyPoll_ = true;
 }
 
-void Pair::receiveMemoryRegion() {
-  auto mr = make_unique<MemoryRegion>(dev_->pd_);
-  struct ibv_sge list = mr->sge();
-  struct ibv_recv_wr wr;
-  memset(&wr, 0, sizeof(wr));
-  wr.sg_list = &list;
-  wr.num_sge = 1;
-
-  // The work request is serialized and sent to the driver so it
-  // doesn't need to be valid after the ibv_post_recv call.
-  struct ibv_recv_wr* bad_wr = nullptr;
-  int rv = ibv_post_recv(qp_, &wr, &bad_wr);
-  if (rv != 0) {
-    signalIoFailure(GLOO_ERROR_MSG("ibv_post_recv: ", rv));
-  }
-
-  // Keep memory region around so that the other side of this pair can
-  // write into it. They are written in a FIFO order so the handler
-  // can always pop off the first entry upon handling the completion.
-  mappedRecvRegions_.push_back(std::move(mr));
-}
-
 void Pair::sendMemoryRegion(struct ibv_mr* src, int slot) {
   auto mr = make_unique<MemoryRegion>(dev_->pd_, src);
   struct ibv_sge list = mr->sge();
   struct ibv_send_wr wr;
   memset(&wr, 0, sizeof(wr));
+  wr.wr_id = slot;
   wr.sg_list = &list;
   wr.num_sge = 1;
   wr.opcode = IBV_WR_SEND_WITH_IMM;
   wr.send_flags = IBV_SEND_SIGNALED;
   wr.imm_data = slot;
-
-  // First post receive work request to avoid racing with
-  // a send to this region from the other side of this pair.
-  postReceive();
 
   // The work request is serialized and sent to the driver so it
   // doesn't need to be valid after the ibv_post_send call.
@@ -250,37 +240,68 @@ void Pair::sendMemoryRegion(struct ibv_mr* src, int slot) {
   }
 
   // Keep memory region around until this send operation completes.
-  // They are posted in a FIFO order so the handler can always pop off
-  // the first entry upon handling the completion.
-  mappedSendRegions_.push_back(std::move(mr));
+  // They are posted in FIFO order, but may complete in arbitrary order.
+  // Therefore we store them in a map keyed on the buffer slot.
+  GLOO_ENFORCE_EQ(mappedSendRegions_.count(slot), 0);
+  mappedSendRegions_[slot] = std::move(mr);
 }
 
 const struct ibv_mr* Pair::getMemoryRegion(int slot) {
-  if (peerMemoryRegionsReady_.load() & (1 << slot)) {
-    return &peerMemoryRegions_[slot];
-  }
-
   std::unique_lock<std::mutex> lock(m_);
-  while (peerMemoryRegions_[slot].addr == nullptr) {
-    if (sync_) {
+  if (sync_) {
+    auto it = peerMemoryRegions_.find(slot);
+    auto start = std::chrono::steady_clock::now();
+    while (it == peerMemoryRegions_.end()) {
       lock.unlock();
       pollCompletions();
       lock.lock();
-    } else {
-      cv_.wait(lock);
+      if (timeout_ != kNoTimeout &&
+          (std::chrono::steady_clock::now() - start) >= timeout_) {
+        lock.unlock();
+        signalIoFailure(
+            GLOO_ERROR_MSG(
+                "Timeout waiting for memory region from ",
+                peer_.str()));
+        GLOO_ENFORCE(false, "Unexpected code path");
+      }
+      it = peerMemoryRegions_.find(slot);
     }
+    return &it->second;
+  } else {
+    auto pred = [&]{
+      return peerMemoryRegions_.find(slot) != peerMemoryRegions_.end();
+    };
+    if (timeout_ == kNoTimeout) {
+      // No timeout set. Wait for read to complete.
+      cv_.wait(lock, pred);
+    } else {
+      auto done = cv_.wait_for(lock, timeout_, pred);
+      if (!done) {
+        signalIoFailure(
+            GLOO_ERROR_MSG(
+                "Timeout waiting for memory region from ",
+                peer_.str()));
+        GLOO_ENFORCE(false, "Unexpected code path");
+      }
+    }
+    auto it = peerMemoryRegions_.find(slot);
+    GLOO_ENFORCE(it != peerMemoryRegions_.end());
+    return &it->second;
   }
-  peerMemoryRegionsReady_ &= (1 << slot);
-  return &peerMemoryRegions_[slot];
 }
 
 void Pair::postReceive() {
-  int rv;
-
+  const auto& mr = mappedRecvRegions_[recvPosted_++ % kMaxBuffers];
+  struct ibv_sge list = mr->sge();
   struct ibv_recv_wr wr;
   memset(&wr, 0, sizeof(wr));
+  wr.sg_list = &list;
+  wr.num_sge = 1;
+
+  // The work request is serialized and sent to the driver so it
+  // doesn't need to be valid after the ibv_post_recv call.
   struct ibv_recv_wr* bad_wr = nullptr;
-  rv = ibv_post_recv(qp_, &wr, &bad_wr);
+  auto rv = ibv_post_recv(qp_, &wr, &bad_wr);
   if (rv != 0) {
     signalIoFailure(GLOO_ERROR_MSG("ibv_post_recv: ", rv));
   }
@@ -288,6 +309,8 @@ void Pair::postReceive() {
 
 std::unique_ptr<::gloo::transport::Buffer>
 Pair::createSendBuffer(int slot, void* ptr, size_t size) {
+  std::unique_lock<std::mutex> lock(m_);
+  GLOO_ENFORCE_EQ(sendCompletionHandlers_.count(slot), 0);
   auto buffer = new Buffer(this, slot, ptr, size);
   sendCompletionHandlers_[slot] = buffer;
   return std::unique_ptr<::gloo::transport::Buffer>(buffer);
@@ -295,10 +318,38 @@ Pair::createSendBuffer(int slot, void* ptr, size_t size) {
 
 std::unique_ptr<::gloo::transport::Buffer>
 Pair::createRecvBuffer(int slot, void* ptr, size_t size) {
+  std::unique_lock<std::mutex> lock(m_);
+  GLOO_ENFORCE_EQ(recvCompletionHandlers_.count(slot), 0);
   auto buffer = new Buffer(this, slot, ptr, size);
   recvCompletionHandlers_[slot] = buffer;
   sendMemoryRegion(buffer->mr_, buffer->slot_);
   return std::unique_ptr<::gloo::transport::Buffer>(buffer);
+}
+
+// Send from the specified buffer to remote side of pair.
+void Pair::send(
+    transport::UnboundBuffer* tbuf,
+    uint64_t /* unused */,
+    size_t /* unused */,
+    size_t /* unused */) {
+  GLOO_THROW_INVALID_OPERATION_EXCEPTION(
+      "Unbound buffers not supported yet for ibverbs transport");
+}
+
+// Receive into the specified buffer from the remote side of pair.
+void Pair::recv(
+    transport::UnboundBuffer* tbuf,
+    uint64_t /* unused */,
+    size_t /* unused */,
+    size_t /* unused */) {
+  GLOO_THROW_INVALID_OPERATION_EXCEPTION(
+      "Unbound buffers not supported yet for ibverbs transport");
+}
+
+// place holder for future use
+bool Pair::isConnected() {
+   GLOO_THROW_INVALID_OPERATION_EXCEPTION(
+      "isConnected not supported yet for ibverbs transport");
 }
 
 // handleCompletionEvent is called by the device thread when it
@@ -324,6 +375,7 @@ void Pair::handleCompletionEvent() {
     GLOO_ENFORCE_EQ(rv, 0);
 
     // Now poll for work completions to drain the completion queue.
+    std::unique_lock<std::mutex> lock(m_);
     pollCompletions();
   } catch (const ::gloo::IoException&) {
     // Catch IO exceptions on the event handling thread. The exception has
@@ -331,6 +383,10 @@ void Pair::handleCompletionEvent() {
   }
 }
 
+// Polls this pair's completion queue for work completions. When
+// called from the device thread, this pair's mutex has already been
+// acquired. When called from the user thread, the mutex won't be
+// acquired (since there's only a single thread using this pair).
 void Pair::pollCompletions() {
   std::array<struct ibv_wc, kCompletionQueueCapacity> wc;
 
@@ -341,10 +397,6 @@ void Pair::pollCompletions() {
 
     // Handle work completions
     for (int i = 0; i < nwc; i++) {
-      if (wc[i].status != IBV_WC_SUCCESS) {
-        continue;
-      }
-
       checkErrorState();
       handleCompletion(&wc[i]);
     }
@@ -358,24 +410,37 @@ void Pair::pollCompletions() {
 
 void Pair::handleCompletion(struct ibv_wc* wc) {
   if (wc->opcode == IBV_WC_RECV_RDMA_WITH_IMM) {
-    // Incoming RDMA write completed. Post new receive work request to
-    // backfill for this completed work request.
-    postReceive();
-
+    // Incoming RDMA write completed.
     // Slot is encoded in immediate data on receive work completion.
-    // It is set in the Buffer::send function.
-    // Bits outside of kBufferSlotMask are currently unused.
-    int slot = wc->imm_data & kBufferSlotMask;
-    GLOO_ENFORCE_EQ(wc->imm_data & ~kBufferSlotMask, 0);
+    // It is set in the Pair::send function.
+    auto slot = wc->imm_data;
+    GLOO_ENFORCE_EQ(
+      wc->status,
+      IBV_WC_SUCCESS,
+      "Recv for slot ",
+      slot,
+      ": ",
+      ibv_wc_status_str(wc->status));
+
     GLOO_ENFORCE(recvCompletionHandlers_[slot] != nullptr);
     recvCompletionHandlers_[slot]->handleCompletion(wc);
+
+    // Backfill receive work requests.
+    postReceive();
   } else if (wc->opcode == IBV_WC_RDMA_WRITE) {
     // Outbound RDMA write completed.
     // Slot is encoded in wr_id fields on send work request. Unlike
     // the receive work completions, the immediate data field on send
     // work requests are not pass to the respective work completion.
-    int slot = wc->wr_id & kBufferSlotMask;
-    GLOO_ENFORCE_EQ(wc->wr_id & ~kBufferSlotMask, 0);
+    auto slot = wc->wr_id;
+    GLOO_ENFORCE_EQ(
+      wc->status,
+      IBV_WC_SUCCESS,
+      "Send for slot ",
+      slot,
+      ": ",
+      ibv_wc_status_str(wc->status));
+
     GLOO_ENFORCE(sendCompletionHandlers_[slot] != nullptr);
     sendCompletionHandlers_[slot]->handleCompletion(wc);
   } else if (wc->opcode == IBV_WC_RECV) {
@@ -390,29 +455,69 @@ void Pair::handleCompletion(struct ibv_wc* wc) {
     // the other side of this pair to send its memory region.
     // Lock access, and notify anybody waiting afterwards.
     //
-    {
-      std::lock_guard<std::mutex> lock(m_);
-      GLOO_ENFORCE_GT(mappedRecvRegions_.size(), 0);
-      auto mr = std::move(mappedRecvRegions_.front());
-      mappedRecvRegions_.pop_front();
+    // Slot is encoded in immediate data on receive work completion.
+    // It is set in the Pair::sendMemoryRegion function.
+    auto slot = wc->imm_data;
+    GLOO_ENFORCE_EQ(
+      wc->status,
+      IBV_WC_SUCCESS,
+      "Memory region recv for slot ",
+      slot,
+      ": ",
+      ibv_wc_status_str(wc->status));
 
-      // Slot is encoded in immediate data on receive work completion.
-      // It is set in the Pair::sendMemoryRegion function.
-      // Bits outside of kBufferSlotMask are currently unused.
-      int slot = wc->imm_data & kBufferSlotMask;
-      GLOO_ENFORCE_EQ(wc->imm_data & ~kBufferSlotMask, 0);
-
-      // Move ibv_mr from memory region 'inbox' to final slot.
-      peerMemoryRegions_[slot] = mr->mr();
-    }
+    // Move ibv_mr from memory region 'inbox' to final slot.
+    const auto& mr = mappedRecvRegions_[recvPosted_ % kMaxBuffers];
+    peerMemoryRegions_[slot] = mr->mr();
 
     // Notify any buffer waiting for the details of its remote peer.
     cv_.notify_all();
+
+    // Backfill receive work requests.
+    postReceive();
   } else if (wc->opcode == IBV_WC_SEND) {
     // Memory region send completed.
-    mappedSendRegions_.pop_front();
+    auto slot = wc->wr_id;
+    GLOO_ENFORCE_EQ(
+      wc->status,
+      IBV_WC_SUCCESS,
+      "Memory region send for slot ",
+      slot,
+      ": ",
+      ibv_wc_status_str(wc->status));
+
+    GLOO_ENFORCE_GT(mappedSendRegions_.size(), 0);
+    GLOO_ENFORCE_EQ(mappedSendRegions_.count(slot), 1);
+    mappedSendRegions_.erase(slot);
   } else {
     GLOO_ENFORCE(false, "Unexpected completion with opcode: ", wc->opcode);
+  }
+}
+
+void Pair::send(Buffer* buffer, size_t offset, size_t length, size_t roffset) {
+  struct ibv_sge list;
+  list.addr = (uint64_t)buffer->ptr_ + offset;
+  list.length = length;
+  list.lkey = buffer->mr_->lkey;
+
+  struct ibv_send_wr wr;
+  memset(&wr, 0, sizeof(wr));
+  wr.wr_id = buffer->slot_;
+  wr.sg_list = &list;
+  wr.num_sge = 1;
+  wr.opcode = IBV_WR_RDMA_WRITE_WITH_IMM;
+  wr.send_flags = IBV_SEND_SIGNALED;
+  wr.imm_data = buffer->slot_;
+
+  const struct ibv_mr* peer = getMemoryRegion(buffer->slot_);
+  GLOO_ENFORCE_NE(peer, (const struct ibv_mr*)nullptr);
+  wr.wr.rdma.remote_addr = (uint64_t)peer->addr + roffset;
+  wr.wr.rdma.rkey = peer->rkey;
+
+  struct ibv_send_wr* bad_wr;
+  auto rv = ibv_post_send(qp_, &wr, &bad_wr);
+  if (rv != 0) {
+    signalIoFailure(GLOO_ERROR_MSG("ibv_post_send: ", rv));
   }
 }
 
@@ -425,20 +530,18 @@ void Pair::signalIoFailure(const std::string& msg) {
     ex_ = std::make_exception_ptr(ex);
     // Loop through the completion handlers and signal that an error has
     // occurred.
-    for (auto handler : recvCompletionHandlers_) {
-      if (handler) {
-        handler->signalError(ex_);
-      }
+    for (auto& it : recvCompletionHandlers_) {
+      GLOO_ENFORCE(it.second != nullptr);
+      it.second->signalError(ex_);
     }
-    for (auto handler : sendCompletionHandlers_) {
-      if (handler) {
-        handler->signalError(ex_);
-      }
+    for (auto& it : sendCompletionHandlers_) {
+      GLOO_ENFORCE(it.second != nullptr);
+      it.second->signalError(ex_);
     }
   }
   // Finally, throw the exception on this thread.
   throw ex;
-};
+}
 
 void Pair::checkErrorState() {
   // If we previously encountered an error, rethrow here.

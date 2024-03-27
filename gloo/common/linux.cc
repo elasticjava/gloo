@@ -3,31 +3,39 @@
  * All rights reserved.
  *
  * This source code is licensed under the BSD-style license found in the
- * LICENSE file in the root directory of this source tree. An additional grant
- * of patent rights can be found in the PATENTS file in the same directory.
+ * LICENSE file in the root directory of this source tree.
  */
 
 #include "gloo/common/linux.h"
+#include "gloo/common/linux_devices.h"
 
 #include <dirent.h>
 #include <errno.h>
 #include <ifaddrs.h>
 #include <linux/ethtool.h>
-#include <linux/if.h>
 #include <linux/sockios.h>
 #include <linux/version.h>
-#include <netdb.h>
+#include <net/if.h>
+#include <netinet/in.h>
 #include <string.h>
 #include <sys/ioctl.h>
 #include <sys/socket.h>
 #include <unistd.h>
 
 #include <algorithm>
+#include <array>
 #include <fstream>
 #include <map>
 #include <mutex>
 
 #include "gloo/common/logging.h"
+
+#ifndef SPEED_UNKNOWN
+/* SPEED_UNKOWN is sometimes undefined, c.f.
+ * https://github.com/facebookincubator/gloo/pull/127
+ */
+#define SPEED_UNKNOWN 0
+#endif
 
 namespace gloo {
 
@@ -83,10 +91,10 @@ static unsigned int pciGetClass(const std::string& id) {
   return pciClass;
 }
 
-std::vector<std::string> pciDevices(int pciClass) {
+std::vector<std::string> pciDevices(PCIClassMatch match) {
   std::vector<std::string> devices;
   for (const auto& device : listDir(kSysfsPath)) {
-    if (pciClass != pciGetClass(device)) {
+    if (match.value != (pciGetClass(device) & match.mask)) {
       continue;
     }
 
@@ -145,6 +153,7 @@ int pciDistance(const std::string& a, const std::string& b) {
 const std::string& interfaceToBusID(const std::string& name) {
   static std::once_flag once;
   static std::map<std::string, std::string> map;
+  static std::string default_busid;
 
   std::call_once(once, [](){
       for (const auto& device : pciDevices(kPCIClassNetwork)) {
@@ -156,7 +165,11 @@ const std::string& interfaceToBusID(const std::string& name) {
       }
     });
 
-  return map[name];
+  auto it = map.find(name);
+  if (it != map.end()) {
+    return it->second;
+  }
+  return default_busid;
 }
 
 const std::string& infinibandToBusID(const std::string& name) {
@@ -180,12 +193,12 @@ static int getInterfaceSpeedGLinkSettings(int sock, struct ifreq* ifr) {
 #if LINUX_VERSION_CODE >= KERNEL_VERSION(4,6,0)
   constexpr auto link_mode_data_nwords = 3 * 127;
   struct {
-    struct ethtool_link_settings req;
     __u32 link_mode_data[link_mode_data_nwords];
+    struct ethtool_link_settings req;
   } ecmd;
   int rv;
 
-  ifr->ifr_data = &ecmd;
+  ifr->ifr_data = (__caddr_t)&ecmd;
   memset(&ecmd, 0, sizeof(ecmd));
   ecmd.req.cmd = ETHTOOL_GLINKSETTINGS;
 
@@ -213,7 +226,7 @@ static int getInterfaceSpeedGSet(int sock, struct ifreq* ifr) {
   struct ethtool_cmd edata;
   int rv;
 
-  ifr->ifr_data = &edata;
+  ifr->ifr_data = (__caddr_t)&edata;
   memset(&edata, 0, sizeof(edata));
   edata.cmd = ETHTOOL_GSET;
 

@@ -3,8 +3,7 @@
  * All rights reserved.
  *
  * This source code is licensed under the BSD-style license found in the
- * LICENSE file in the root directory of this source tree. An additional grant
- * of patent rights can be found in the PATENTS file in the same directory.
+ * LICENSE file in the root directory of this source tree.
  */
 
 #pragma once
@@ -15,7 +14,8 @@
 
 namespace gloo {
 
-template <typename T, typename W = CudaHostWorkspace<T> >
+template <typename T, typename W = CudaHostWorkspace<T>>
+
 class CudaBroadcastOneToAll : public Algorithm {
  public:
   CudaBroadcastOneToAll(
@@ -37,10 +37,14 @@ class CudaBroadcastOneToAll : public Algorithm {
       typename std::enable_if<std::is_same<U, CudaHostWorkspace<T> >::value,
                               typename U::Pointer>::type* = 0);
 
+  template <typename U = W>
+  void init(
+      typename std::enable_if<std::is_same<U, CudaDeviceWorkspace<T> >::value,
+                              typename U::Pointer>::type* = 0);
+
   std::vector<CudaDevicePointer<T> > devicePtrs_;
   std::vector<CudaStream> streams_;
   typename W::Pointer scratch_;
-
   const int count_;
   const int bytes_;
   const int rootRank_;
@@ -48,10 +52,22 @@ class CudaBroadcastOneToAll : public Algorithm {
   const bool synchronizeDeviceOutputs_;
 
   // For the sender (root)
-  std::vector<std::unique_ptr<transport::Buffer>> sendDataBuffers_;
+  struct forSender {
+    int dummy;
+    std::unique_ptr<transport::Buffer> clearToSendBuffer;
+    std::unique_ptr<transport::Buffer> sendBuffer;
+  };
+
+  std::vector<std::unique_ptr<forSender>> sender_;
 
   // For all receivers
-  std::unique_ptr<transport::Buffer> recvDataBuffer_;
+  struct forReceiver {
+    int dummy;
+    std::unique_ptr<transport::Buffer> clearToSendBuffer;
+    std::unique_ptr<transport::Buffer> recvBuffer;
+  };
+
+  std::unique_ptr<forReceiver> receiver_;
 
   // For local broadcast
   std::unique_ptr<LocalOp<T> > localBroadcastOp_;

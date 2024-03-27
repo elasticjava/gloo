@@ -3,8 +3,7 @@
  * All rights reserved.
  *
  * This source code is licensed under the BSD-style license found in the
- * LICENSE file in the root directory of this source tree. An additional grant
- * of patent rights can be found in the PATENTS file in the same directory.
+ * LICENSE file in the root directory of this source tree.
  */
 
 #include "gloo/rendezvous/redis_store.h"
@@ -17,8 +16,6 @@
 
 namespace gloo {
 namespace rendezvous {
-
-static const std::chrono::seconds kWaitTimeout = std::chrono::seconds(60);
 
 RedisStore::RedisStore(const std::string& host, int port) {
   struct timeval timeout = {.tv_sec = 2};

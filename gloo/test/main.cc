@@ -3,11 +3,22 @@
  * All rights reserved.
  *
  * This source code is licensed under the BSD-style license found in the
- * LICENSE file in the root directory of this source tree. An additional grant
- * of patent rights can be found in the PATENTS file in the same directory.
+ * LICENSE file in the root directory of this source tree.
  */
 
 #include <gtest/gtest.h>
+
+// One-time init to use EPIPE errors instead of SIGPIPE
+#ifndef _WIN32
+namespace {
+struct Initializer {
+  Initializer() {
+    signal(SIGPIPE, SIG_IGN);
+  }
+};
+Initializer initializer;
+} // namespace
+#endif
 
 int main(int argc, char** argv) {
   ::testing::InitGoogleTest(&argc, argv);

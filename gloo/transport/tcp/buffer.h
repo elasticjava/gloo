@@ -3,12 +3,12 @@
  * All rights reserved.
  *
  * This source code is licensed under the BSD-style license found in the
- * LICENSE file in the root directory of this source tree. An additional grant
- * of patent rights can be found in the PATENTS file in the same directory.
+ * LICENSE file in the root directory of this source tree.
  */
 
 #pragma once
 
+#include <atomic>
 #include <condition_variable>
 #include <exception>
 #include <map>
@@ -32,15 +32,12 @@ class Buffer : public ::gloo::transport::Buffer {
   virtual void waitRecv() override;
   virtual void waitSend() override;
 
- protected:
-  // May only be constructed from helper function in pair.cc
-  Buffer(Pair* pair, int slot, void* ptr, size_t size);
-
   void handleRecvCompletion();
   void handleSendCompletion();
 
-  void signalError(const std::exception_ptr& ex);
-  void checkErrorState();
+ protected:
+  // May only be constructed from helper function in pair.cc
+  Buffer(Pair* pair, int slot, void* ptr, size_t size);
 
   Pair* pair_;
 
@@ -50,8 +47,15 @@ class Buffer : public ::gloo::transport::Buffer {
 
   int recvCompletions_;
   int sendCompletions_;
+  std::atomic<int> sendPending_;
 
   std::exception_ptr ex_;
+
+  // Throws if an exception if set.
+  void throwIfException();
+
+  // Set exception and wake up any waitRecv/waitSend threads.
+  void signalException(std::exception_ptr);
 
   friend class Pair;
 };

@@ -19,11 +19,11 @@ Terms used:
 
 ## Allreduce
 
-Compute sum of N arrays per process across P processes. This
-computation happens in place; all input arrays contain the resulting
-sum after the algorithm completes.
+Compute user-specified reduction operation (for e.g. sum) of N arrays per process
+across P processes. This computation happens in place; all input arrays contain
+the resulting reduction after the algorithm completes.
 
-There's 3 phases to each implementation of this algorithm:
+There are 3 phases to each implementation of this algorithm:
 1. Local reduction of N buffers
 2. Allreduce between processes
 3. Broadcast result back to N buffers
@@ -100,7 +100,7 @@ at each step. At each process and step, the portion of the buffer that was being
 sent in the reduce-scatter is received in the allgather, and the portion that was
 being received in the reduce-scatter is now sent.
 
-Across the steps of the reduce-scatter, data is received intto different buffers
+Across the steps of the reduce-scatter, data is received into different buffers
 and there is no potential for race conditions. However, mirrored steps of the
 reduce-scatter and allgather (e.g. last step of the reduce-scatter and first
 step of the allgather) write into the same buffers. To prevent race conditions,
@@ -109,6 +109,38 @@ subphase. This notification is processed in the allgather subphase prior to
 performing the send. In the majority of cases these notification messages will
 arrive long before the step of the allgather where they are processed, so their
 effect on performance should be minimal.
+
+When running on non-power-of-two number of processes, the algorithm works by
+breaking up execution into blocks that are powers of two and communicating
+interblock after the intrablock reduce-scatter. Non-power-of-two cases will have
+some degree of load imbalance compared to power-of-two, but cases with few large
+blocks (e.g. 8 + 4 or 16 + 8) should still perform relatively well.
+
+The halving-doubling / binary-blocks algorithm is described and analyzed in
+(Thakur et al., Optimization of Collective Communication Operations in MPICH,
+IJHPCA, 2005).
+
+### allreducube_bcube
+
+Additional variables used:
+* **B**: Base (maximum number of peers per step)
+
+* Communication steps: 2\*log_B(P)
+* Bytes on the wire: 2\*Sum(S/B^s) {s: 0 to log_B(P) - 1}
+
+This is another allreduce implementation. Bcube is a scheme where nodes are
+divided in groups. In reduce-scatter stage, in each group, a node peers with
+`base - 1` other nodes. In the first step data is reduced between nodes
+within the group. In the next step each node of a group peers with `base - 1`
+nodes from other exclusively different groups. Since each node would start
+with reduced data communicating with it would be like communicating with
+`base` number of nodes/groups from the previous step. This process continues
+until all the groups are covered and to be able to do that the algorithm
+would have log_base(n) number of steps. Each step the node reduces
+totalNumElems / (base^step) amount of elements. At the end of reduce-scatter
+stage each node would have reduced a chunk of elements. Now, in all-gather
+we follow a reverse process of reduce-scatter to communicate the reduced data
+with other nodes.
 
 ### cuda_allreduce_ring
 
@@ -131,8 +163,69 @@ available.
 
 ### cuda_allreduce_halving_doubling
 
-CUDA-aware implementation of `allreduce_halving_doubling`. Currently no
-pipelining is done between reduction/broadcast steps and the communication.
+CUDA-aware implementation of `allreduce_halving_doubling` with no
+pipelining between reduction/broadcast steps and the communication.
+
+### cuda_allreduce_halving_doubling_pipelined
+
+CUDA-aware implementation of `allreduce_halving_doubling` with pipelining
+between local reduction/broadcast steps and communication. Local reduction step
+is split into two steps (since the first communication step sends half the
+buffer size). Final broadcast is pipelined across lgP steps, with each step
+corresponding to a receive during the allgather phase.
+
+## Reduce-Scatter
+
+Compute user-specified reduction operation (for e.g. sum) of N arrays per process
+across P processes. This computation happens in place. The result is scattered
+to all processes as specified by the user; all input arrays contain the scattered
+result after the algorithm completes.
+
+There are 3 phases to each implementation of this algorithm:
+
+1. Local reduction of N buffers
+
+2. Reduce-Scatter between processes
+
+3. Broadcast result back to N buffers
+
+### reduce_scatter_halving_doubling
+
+* Communication steps: lg(P)
+* Bytes on the wire: S
+(for scattering result evenly among P processes)
+
+Phase 2 is implemented in two sub-phases:
+
+1. First, a reduce-scatter is performed in lg(P) steps using a recursive
+vector-halving, distance-doubling approach. In the first step of this algorithm
+processes communicate in pairs (rank 0 with 1, 2 with 3, etc.), sending and
+receiving for different halves of their input buffer. For example, process 0
+sends the second half of its buffer to process 1 and receives and reduces data
+for the first half of the buffer from process 1. A reduction over the received
+data is performed before proceeding to the next communication step, where the
+distance to the destination rank is doubled while the data sent and received is
+halved.
+
+2. After the reduce-scatter phase is finished, each process in the largest
+binary block has a portion of the final reduced array. Next step is to
+scatter/distribute based on user-specified distribution. Note that, due to
+nature of recursive halving algorithm in the largest binary block, the blocks are
+not ordered in correct order. Enforced correct reorder by exchanging data between
+processes p and p',  where p' is the bit-reverse of p.
+
+When running on non-power-of-two number of processes, the algorithm works by
+breaking up execution into blocks that are powers of two and communicating
+interblock after the intrablock reduce-scatter. Non-power-of-two cases will have
+some degree of load imbalance compared to power-of-two, but cases with close to
+power-of-two (for e.g. 16 + 2) should still perform relatively well.
+
+The halving-doubling / binary-blocks algorithm is described and analyzed in
+(Thakur et al., Optimization of Collective Communication Operations in MPICH,
+IJHPCA, 2005).
+
+Data re-ordering is described in (Sack et al., Faster topology-aware collective
+algorithms through non-minimal communication, PPoPP, 2012).
 
 ## Barrier
 
@@ -169,3 +262,15 @@ Broadcast contents of buffer on one process to other P-1 processes.
 _Non-root processes_: receive buffer from root.
 
 _Root process_: send buffer to P-1 processes.
+
+## pairwise_exchange
+
+* Communication steps: variable
+* Bytes on the wire: S
+
+A communication pattern similar to the halving-doubling reduce-scatter,
+simplified for benchmarking purposes. The number of communication steps, C
+(which must be between 1 and lg(P)) is specified as input to the algorithm. In
+each step, the set of nodes is partitioned into pairs as in the corresponding
+step of halving-doubling reduce-scatter. Unlike the reduce-scatter, however, the
+buffer size sent in each step is the same (equal to S/C).

@@ -3,8 +3,7 @@
  * All rights reserved.
  *
  * This source code is licensed under the BSD-style license found in the
- * LICENSE file in the root directory of this source tree. An additional grant
- * of patent rights can be found in the PATENTS file in the same directory.
+ * LICENSE file in the root directory of this source tree.
  */
 
 #include "gloo/algorithm.h"
@@ -22,7 +21,7 @@ Algorithm::Algorithm(const std::shared_ptr<Context>& context)
       contextSize_(context_->size) {}
 
 // Have to provide implementation for pure virtual destructor.
-Algorithm::~Algorithm() {}
+Algorithm::~Algorithm() noexcept(false) {}
 
 std::unique_ptr<transport::Pair>& Algorithm::getPair(int i) {
   return context_->getPair(i);

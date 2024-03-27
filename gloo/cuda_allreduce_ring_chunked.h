@@ -3,11 +3,12 @@
  * All rights reserved.
  *
  * This source code is licensed under the BSD-style license found in the
- * LICENSE file in the root directory of this source tree. An additional grant
- * of patent rights can be found in the PATENTS file in the same directory.
+ * LICENSE file in the root directory of this source tree.
  */
 
 #pragma once
+
+#include <array>
 
 #include "gloo/algorithm.h"
 #include "gloo/cuda.h"
@@ -36,24 +37,22 @@ class CudaAllreduceRingChunked : public Algorithm {
   template <typename U = W>
   void init(
     typename std::enable_if<std::is_same<U, CudaHostWorkspace<T> >::value,
-    typename U::Pointer>::type* = 0);
+    typename U::Pointer>::type* = nullptr);
 
   template <typename U = W>
   void init(
     typename std::enable_if<std::is_same<U, CudaDeviceWorkspace<T> >::value,
-    typename U::Pointer>::type* = 0);
+    typename U::Pointer>::type* = nullptr);
 
   std::vector<CudaDevicePointer<T> > devicePtrs_;
   std::vector<CudaStream> streams_;
   typename W::Pointer scratch_;
+  CudaStream* scratchStream_;
 
   const int count_;
   const int bytes_;
   const bool synchronizeDeviceOutputs_;
   const CudaReductionFunction<T>* fn_;
-
-  std::unique_ptr<transport::Pair>& leftPair_;
-  std::unique_ptr<transport::Pair>& rightPair_;
 
   size_t chunks_;
   size_t chunkSize_;

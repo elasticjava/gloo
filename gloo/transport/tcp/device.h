@@ -3,40 +3,30 @@
  * All rights reserved.
  *
  * This source code is licensed under the BSD-style license found in the
- * LICENSE file in the root directory of this source tree. An additional grant
- * of patent rights can be found in the PATENTS file in the same directory.
+ * LICENSE file in the root directory of this source tree.
  */
 
 #pragma once
 
+#include <array>
 #include <atomic>
 #include <condition_variable>
 #include <memory>
 #include <mutex>
 #include <thread>
 
-#include <sys/socket.h>
-
-#include "gloo/transport/device.h"
+#include <gloo/transport/device.h>
+#include <gloo/transport/tcp/attr.h>
+#include <gloo/transport/tcp/error.h>
+#include <gloo/transport/tcp/listener.h>
+#include <gloo/transport/tcp/loop.h>
+#include <gloo/transport/tcp/socket.h>
 
 namespace gloo {
 namespace transport {
 namespace tcp {
 
-struct attr {
-  attr() {}
-  /* implicit */ attr(const char* ptr) : hostname(ptr) {}
-
-  std::string hostname;
-
-  // The address family defaults to AF_UNSPEC such that getaddrinfo(3)
-  // will try to find either IPv4 or IPv6 addresses.
-  int ai_family = AF_UNSPEC;
-  int ai_socktype;
-  int ai_protocol;
-  struct sockaddr_storage ai_addr;
-  int ai_addrlen;
-};
+struct attr CreateDeviceAttr(const struct attr& src);
 
 std::shared_ptr<::gloo::transport::Device> CreateDevice(
     const struct attr&);
@@ -57,36 +47,71 @@ class Device : public ::gloo::transport::Device,
 
   virtual int getInterfaceSpeed() const override;
 
-  virtual void setTimeout(const std::chrono::milliseconds& timeout) override;
+  virtual std::shared_ptr<::gloo::transport::Context> createContext(
+      int rank, int size) override;
 
-  virtual std::unique_ptr<::gloo::transport::Pair> createPair()
-      override;
+  void registerDescriptor(int fd, int events, Handler* h);
+  void unregisterDescriptor(int fd, Handler* h);
+
+  // TCP is bidirectional so when we connect two ends of a pair,
+  // one side is the connection initiator and the other is the listener.
+  bool isInitiator(
+      const Address& local,
+      const Address& remote) const;
 
  protected:
-  void loop();
-
-  std::chrono::milliseconds getTimeout();
-  void registerDescriptor(int fd, int events, Pair* p);
-  void unregisterDescriptor(int fd);
-
   const struct attr attr_;
-  std::atomic<bool> done_;
-  std::unique_ptr<std::thread> loop_;
+
+  // Return a new `Address` instance.
+  //
+  // This is called by the constructor of the `Pair` class. It gives
+  // the pair a uniquely identifying address even though the device
+  // uses a shared listening socket.
+  //
+  Address nextAddress();
+
+  // Connect a pair to a remote.
+  //
+  // This is performed by the device instance because we use a single
+  // listening socket for all inbound pair connections.
+  //
+  // Matching these connections with pairs is done with a handshake.
+  // The remote side of the connection writes a sequence number (see
+  // `Address::sequence_t`) to the stream that identifies the pair
+  // it wants to connect to. On the local side, this sequence number
+  // is read and used as key in a map with callbacks. If the callback
+  // is found, it is called. If the callback is not found, the
+  // connection is cached in a map, using the sequence number.
+  //
+  using connect_callback_t =
+      std::function<void(std::shared_ptr<Socket> socket, Error error)>;
+
+  void connect(
+      const Address& local,
+      const Address& remote,
+      std::chrono::milliseconds timeout,
+      connect_callback_t fn);
+
+  void connectAsListener(
+      const Address& local,
+      std::chrono::milliseconds timeout,
+      connect_callback_t fn);
+
+  void connectAsInitiator(
+      const Address& remote,
+      std::chrono::milliseconds timeout,
+      connect_callback_t fn);
 
   friend class Pair;
   friend class Buffer;
 
  private:
-  static constexpr auto capacity_ = 64;
+  std::shared_ptr<Loop> loop_;
+  std::shared_ptr<Listener> listener_;
 
-  int fd_;
-  std::chrono::milliseconds timeout_;
   std::string interfaceName_;
   int interfaceSpeedMbps_;
   std::string pciBusID_;
-
-  std::mutex m_;
-  std::condition_variable cv_;
 };
 
 } // namespace tcp

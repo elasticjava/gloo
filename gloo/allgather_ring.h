@@ -3,8 +3,7 @@
  * All rights reserved.
  *
  * This source code is licensed under the BSD-style license found in the
- * LICENSE file in the root directory of this source tree. An additional grant
- * of patent rights can be found in the PATENTS file in the same directory.
+ * LICENSE file in the root directory of this source tree.
  */
 
 #pragma once
@@ -28,7 +27,7 @@ class AllgatherRing : public Algorithm {
  public:
   AllgatherRing(
       const std::shared_ptr<Context>& context,
-      const std::vector<T*>& inPtrs,
+      const std::vector<const T*>& inPtrs,
       T* outPtr,
       int count)
       : Algorithm(context),
@@ -56,6 +55,10 @@ class AllgatherRing : public Algorithm {
   virtual ~AllgatherRing() {}
 
   void run() {
+    // Short circuit if there is only a single process or the output is empty.
+    if (this->contextSize_ == 1 || count_ == 0) {
+      return;
+    }
     const int rank = this->contextRank_;
     const int numRounds = this->contextSize_ - 1;
 
@@ -89,7 +92,7 @@ class AllgatherRing : public Algorithm {
   }
 
  private:
-  const std::vector<T*> inPtrs_;
+  const std::vector<const T*> inPtrs_;
   T* outPtr_;
   const int count_;
   const int bytes_;

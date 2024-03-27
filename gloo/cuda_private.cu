@@ -3,25 +3,60 @@
  * All rights reserved.
  *
  * This source code is licensed under the BSD-style license found in the
- * LICENSE file in the root directory of this source tree. An additional grant
- * of patent rights can be found in the PATENTS file in the same directory.
+ * LICENSE file in the root directory of this source tree.
  */
 
 #include "gloo/cuda_private.h"
 
+#include <array>
+
+#include <cuda.h>
+
+// Disable strict aliasing errors for CUDA 9.
+#if CUDA_VERSION >= 9000
+#ifdef __GNUC__
+#if __GNUC__ > 4 || (__GNUC__ == 4 && __GNUC_MINOR__ >= 6)
+#pragma GCC diagnostic push
+#endif
+#pragma GCC diagnostic ignored "-Wstrict-aliasing"
+#endif // __GNUC__
+#endif // CUDA_VERSION >= 9000
+#include <cuda_fp16.h>
+#if CUDA_VERSION >= 9000
+#ifdef __GNUC__
+#if __GNUC__ > 4 || (__GNUC__ == 4 && __GNUC_MINOR__ >= 6)
+#pragma GCC diagnostic pop
+#endif
+#endif // __GNUC__
+#endif // CUDA_VERSION >= 9000
+
 #include "gloo/common/common.h"
+#include "gloo/types.h"
 
 namespace gloo {
 
 template<typename T>
 __global__ void initializeMemory(
     T* ptr,
-    const T val,
+    const int val,
     const size_t count,
     const size_t stride) {
   int i = blockIdx.x * blockDim.x + threadIdx.x;
   for (; i < count; i += blockDim.x) {
     ptr[i] = (i * stride) + val;
+  }
+}
+
+template<>
+__global__ void initializeMemory<float16>(
+    float16* ptr,
+    const int val,
+    const size_t count,
+    const size_t stride) {
+  int i = blockIdx.x * blockDim.x + threadIdx.x;
+  half* ptrAsHalf = (half*) ptr;
+  for (; i < count; i += blockDim.x) {
+    ptrAsHalf[i] = __float2half(static_cast<float>((i * stride) + val));
   }
 }
 
@@ -46,7 +81,7 @@ CudaMemory<T>::CudaMemory(CudaMemory<T>&& other) noexcept
 }
 
 template<typename T>
-CudaMemory<T>::~CudaMemory() {
+CudaMemory<T>::~CudaMemory() noexcept(false) {
   CudaDeviceScope scope(device_);
   if (ptr_ != nullptr) {
     // Sychronize memory allocation with NCCL operations
@@ -55,24 +90,28 @@ CudaMemory<T>::~CudaMemory() {
   }
 }
 
-template<typename T>
-void CudaMemory<T>::set(T val, size_t stride, cudaStream_t stream) {
-  CudaDeviceScope scope(device_);
-  if (stream == kStreamNotSet) {
-    initializeMemory<<<1, 32>>>(ptr_, val, elements, stride);
-  } else {
-    initializeMemory<<<1, 32, 0, stream>>>(ptr_, val, elements, stride);
-  }
-}
-
-template<typename T>
-std::unique_ptr<T[]> CudaMemory<T>::copyToHost() const {
-  auto host = make_unique<T[]>(elements);
-  cudaMemcpy(host.get(), ptr_, bytes, cudaMemcpyDefault);
-  return host;
-}
-
 // Instantiate template
 template class CudaMemory<float>;
+template class CudaMemory<float16>;
+
+// Lookup PCI bus IDs for device.
+// As the number of available devices won't change at
+// runtime we can seed this cache on the first call.
+const std::string& getCudaPCIBusID(int device) {
+  static std::once_flag once;
+  static std::vector<std::string> busIDs;
+
+  std::call_once(once, [](){
+    std::array<char, 16> buf;
+    auto count = getDeviceCount();
+    busIDs.resize(count);
+    for (auto i = 0; i < count; i++) {
+      CUDA_CHECK(cudaDeviceGetPCIBusId(buf.data(), buf.size(), i));
+      busIDs[i] = buf.data();
+    }
+  });
+
+  return busIDs[device];
+}
 
 } // namespace gloo

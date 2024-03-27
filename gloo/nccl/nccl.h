@@ -3,8 +3,7 @@
  * All rights reserved.
  *
  * This source code is licensed under the BSD-style license found in the
- * LICENSE file in the root directory of this source tree. An additional grant
- * of patent rights can be found in the PATENTS file in the same directory.
+ * LICENSE file in the root directory of this source tree.
  */
 
 #pragma once
@@ -16,6 +15,7 @@
 
 #include "gloo/common/logging.h"
 #include "gloo/cuda.h"
+#include "gloo/types.h"
 
 namespace gloo {
 namespace nccl {
@@ -34,17 +34,22 @@ namespace nccl {
         ncclGetErrorString(status));   \
   } while (0)
 
+#define NCCL_VERSION_MIN(major, minor, patch) \
+  ((NCCL_MAJOR > major) || \
+    ((NCCL_MAJOR == major) && ((NCCL_MINOR > minor) || \
+      ((NCCL_MINOR == minor) && (NCCL_PATCH >= patch)) )))
+
 template <typename T>
 struct NCCLElement {
   NCCLElement(
-      CudaDevicePointer<T> src,
-      CudaStream& srcStream,
-      CudaDevicePointer<T> dst,
-      CudaStream& dstStream)
-      : src(std::move(src)),
-        srcStream(srcStream),
-        dst(std::move(dst)),
-        dstStream(srcStream),
+      CudaDevicePointer<T> srcParam,
+      CudaStream& srcStreamParam,
+      CudaDevicePointer<T> dstParam,
+      CudaStream& dstStreamParam)
+      : src(std::move(srcParam)),
+        srcStream(srcStreamParam),
+        dst(std::move(dstParam)),
+        dstStream(dstStreamParam),
         device(src.getDeviceID()) {
     GLOO_ENFORCE_EQ(
         src.getCount(),
@@ -68,7 +73,7 @@ class NCCLExecution {
  public:
   /* implicit */ NCCLExecution(std::vector<NCCLElement<T>>&& elements);
   NCCLExecution(NCCLExecution&&) = default;
-  ~NCCLExecution();
+  ~NCCLExecution() noexcept(false);
 
   std::vector<int> getDevices() const;
   std::string getKey() const;

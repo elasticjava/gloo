@@ -3,8 +3,7 @@
  * All rights reserved.
  *
  * This source code is licensed under the BSD-style license found in the
- * LICENSE file in the root directory of this source tree. An additional grant
- * of patent rights can be found in the PATENTS file in the same directory.
+ * LICENSE file in the root directory of this source tree.
  */
 
 #include "gloo/rendezvous/file_store.h"
@@ -15,13 +14,17 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <unistd.h>
-
 #include <array>
 #include <fstream>
 #include <functional>
 #include <iostream>
 #include <thread>
+
+#ifndef _WIN32
+#include <unistd.h>
+#else
+#include <io.h>
+#endif
 
 #include "gloo/common/error.h"
 #include "gloo/common/logging.h"
@@ -61,6 +64,9 @@ std::string FileStore::objectPath(const std::string& name) {
 void FileStore::set(const std::string& key, const std::vector<char>& data) {
   auto tmp = tmpPath(key);
   auto path = objectPath(key);
+
+  // Save file path
+  keyFilePaths_.emplace_back(path);
 
   {
     // Fail if the key already exists. This implementation is not race free.
@@ -144,6 +150,10 @@ void FileStore::wait(
     /* sleep override */
     std::this_thread::sleep_for(std::chrono::milliseconds(10));
   }
+}
+
+std::vector<std::string> FileStore::getAllKeyFilePaths() {
+  return keyFilePaths_;
 }
 
 } // namespace rendezvous

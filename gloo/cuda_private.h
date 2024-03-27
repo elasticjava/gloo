@@ -3,17 +3,22 @@
  * All rights reserved.
  *
  * This source code is licensed under the BSD-style license found in the
- * LICENSE file in the root directory of this source tree. An additional grant
- * of patent rights can be found in the PATENTS file in the same directory.
+ * LICENSE file in the root directory of this source tree.
  */
 
 #pragma once
 
+#include <cstdint>
+#include <functional>
 #include <memory>
 #include <mutex>
 
+#ifdef __linux__
+#include "gloo/common/linux.h"
+#endif
 #include "gloo/common/logging.h"
 #include "gloo/cuda.h"
+#include "gloo/transport/device.h"
 
 namespace gloo {
 
@@ -49,12 +54,52 @@ inline int getDeviceCount() {
   return count;
 }
 
+const std::string& getCudaPCIBusID(int device);
+
+template<typename T>
+int findCudaDevicePointerClosestToDevice(
+    std::vector<CudaDevicePointer<T> >& ptrs,
+    std::shared_ptr<transport::Device>& dev) {
+  // Compute distance between every pointer
+  auto devBusID = dev->getPCIBusID();
+  std::vector<int> distance(ptrs.size());
+  int minDistance = INT_MAX;
+  int minDistanceCount = 0;
+  for (auto i = 0; i < ptrs.size(); i++) {
+#ifdef __linux__
+    auto cudaBusID = getCudaPCIBusID(ptrs[i].getDeviceID());
+    distance[i] = pciDistance(devBusID, cudaBusID);
+#else
+    distance[i] = 0;
+#endif
+    if (distance[i] <= minDistance) {
+      if (distance[i] < minDistance) {
+        minDistance = distance[i];
+        minDistanceCount = 0;
+      }
+      minDistanceCount++;
+    }
+  }
+  // Choose random pointer closest to device;
+  auto minOffset = rand() % minDistanceCount;
+  int minIndex = 0;
+  for (auto i = 0; i < ptrs.size(); i++) {
+    if (distance[i] == minDistance) {
+      if (minOffset == 0) {
+        minIndex = i;
+      }
+      minOffset--;
+    }
+  }
+  return minIndex;
+}
+
 class CudaDeviceGuard {
  public:
   CudaDeviceGuard() : previous_(getCurrentGPUID()) {
   }
 
-  ~CudaDeviceGuard() {
+  ~CudaDeviceGuard() noexcept(false) {
     CUDA_CHECK(cudaSetDevice(previous_));
   }
 
@@ -73,21 +118,17 @@ class CudaDeviceScope {
 };
 
 // Managed chunk of GPU memory.
-// Convience class used for tests and benchmarks.
+// Convenience class used for tests and benchmarks.
 template<typename T>
 class CudaMemory {
  public:
   explicit CudaMemory(size_t elements);
   CudaMemory(CudaMemory&&) noexcept;
-  ~CudaMemory();
-
-  void set(T val, size_t stride = 0, cudaStream_t stream = kStreamNotSet);
+  ~CudaMemory() noexcept(false);
 
   T* operator*() const {
     return ptr_;
   }
-
-  std::unique_ptr<T[]> copyToHost() const;
 
   const size_t elements;
   const size_t bytes;
@@ -107,7 +148,7 @@ class CudaDeviceStreams {
     const int numDevices = getDeviceCount();
     streams_.reserve(numDevices);
     for (auto i = 0; i < numDevices; i++) {
-      streams_.push_back(CudaStream(i));
+      streams_.emplace_back(i);
     }
   }
   cudaStream_t operator[](const int i) {

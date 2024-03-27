@@ -3,8 +3,7 @@
  * All rights reserved.
  *
  * This source code is licensed under the BSD-style license found in the
- * LICENSE file in the root directory of this source tree. An additional grant
- * of patent rights can be found in the PATENTS file in the same directory.
+ * LICENSE file in the root directory of this source tree.
  */
 
 #include "gloo/test/multiproc_test.h"
@@ -12,8 +11,9 @@
 #include <fcntl.h>
 #include <ftw.h>
 
-#include <string>
+#include <array>
 #include <sstream>
+#include <string>
 #include <vector>
 
 #include "gloo/common/error.h"
@@ -28,8 +28,7 @@ static std::string createTempDirectory() {
 }
 
 static int removeTree(const std::string& root) {
-  static auto fn = [](
-      const char* path, const struct stat*, int, struct FTW*) {
+  static auto fn = [](const char* path, const struct stat*, int, struct FTW*) {
     return remove(path);
   };
   return nftw(root.c_str(), fn, 20, FTW_DEPTH);
@@ -55,26 +54,31 @@ void MultiProcTest::TearDown() {
 }
 
 void MultiProcTest::spawnAsync(
-    int size,
+    Transport transport,
+    int numRanks,
     std::function<void(std::shared_ptr<Context>)> fn) {
   // Start a process for each rank
-  for (auto i = 0; i < size; i++) {
+  for (auto i = 0; i < numRanks; i++) {
     const auto pid = fork();
     ASSERT_GE(pid, 0);
     if (pid == 0) {
-      const auto result = runWorker(size, i, fn);
+      // Forked process will create a Context and run the provided function,
+      // exiting upon completion.
+      const auto result = runWorker(transport, numRanks, i, fn);
       exit(result);
     } else {
+      // Parent process tracks all forked child processes.
       workers_.push_back(pid);
     }
   }
+
   // Wait for all processes to finish initializing. Set a sufficiently
   // large timeout so that we do not block forever in case one of the processes
   // fails.
   struct timespec ts;
   ASSERT_EQ(0, clock_gettime(CLOCK_REALTIME, &ts));
   ts.tv_sec += 30;
-  for (auto i = 0; i < size; i++) {
+  for (auto i = 0; i < numRanks; i++) {
     ASSERT_EQ(0, sem_timedwait(semaphore_, &ts));
   }
   workerResults_.resize(workers_.size());
@@ -83,11 +87,10 @@ void MultiProcTest::spawnAsync(
 void MultiProcTest::signalProcess(int rank, int signal) {
   ASSERT_LT(rank, workers_.size());
   const auto result = kill(workers_[rank], signal);
-  ASSERT_EQ(0, result);
+  ASSERT_EQ(0, result) << "Unable to kill process with pid " << workers_[rank];
 }
 
-void MultiProcTest::wait()
-{
+void MultiProcTest::wait() {
   for (auto i = 0; i < workers_.size(); i++) {
     waitProcess(i);
   }
@@ -97,13 +100,14 @@ void MultiProcTest::waitProcess(int rank) {
   ASSERT_LT(rank, workers_.size());
   const auto& worker = workers_[rank];
   const auto& pid = waitpid(worker, &workerResults_[rank], 0);
-  ASSERT_EQ(pid, worker);
+  ASSERT_EQ(pid, worker) << "Encountered error while waiting for pid " << pid << " to change state.";
 }
 
 void MultiProcTest::spawn(
+    Transport transport,
     int size,
     std::function<void(std::shared_ptr<Context>)> fn) {
-  spawnAsync(size, fn);
+  spawnAsync(transport, size, fn);
   wait();
   for (auto i = 0; i < workerResults_.size(); i++) {
     ASSERT_TRUE(WIFEXITED(workerResults_[i]));
@@ -112,12 +116,13 @@ void MultiProcTest::spawn(
 }
 
 int MultiProcTest::runWorker(
+    Transport transport,
     int size,
     int rank,
     std::function<void(std::shared_ptr<Context>)> fn) {
   try {
     MultiProcWorker worker(storePath_, semaphoreName_);
-    worker.run(size, rank, fn);
+    worker.run(transport, size, rank, fn);
   } catch (const ::gloo::IoException&) {
     return kExitWithIoException;
   }
